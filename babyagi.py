@@ -5,10 +5,11 @@ import time
 from collections import deque
 from typing import Dict, List
 import importlib
-
+import chromadb
+from chromadb.config import Settings
 import openai
-import pinecone
 from dotenv import load_dotenv
+import hashlib
 
 # Load default environment variables (.env)
 load_dotenv()
@@ -22,6 +23,9 @@ assert OPENAI_API_KEY, "OPENAI_API_KEY environment variable is missing from .env
 OPENAI_API_MODEL = os.getenv("OPENAI_API_MODEL", "gpt-3.5-turbo")
 assert OPENAI_API_MODEL, "OPENAI_API_MODEL environment variable is missing from .env"
 
+chroma_settings = Settings(
+    chroma_db_impl="duckdb+parquet", persist_directory="db")
+
 if "gpt-4" in OPENAI_API_MODEL.lower():
     print(
         "\033[91m\033[1m"
@@ -29,25 +33,15 @@ if "gpt-4" in OPENAI_API_MODEL.lower():
         + "\033[0m\033[0m"
     )
 
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY", "")
-assert PINECONE_API_KEY, "PINECONE_API_KEY environment variable is missing from .env"
-
-PINECONE_ENVIRONMENT = os.getenv("PINECONE_ENVIRONMENT", "")
-assert (
-    PINECONE_ENVIRONMENT
-), "PINECONE_ENVIRONMENT environment variable is missing from .env"
-
-# Table config
-YOUR_TABLE_NAME = os.getenv("TABLE_NAME", "")
-assert YOUR_TABLE_NAME, "TABLE_NAME environment variable is missing from .env"
 
 # Goal configuation
 OBJECTIVE = os.getenv("OBJECTIVE", "")
+#create a unique collection name
+coll_name = hashlib.md5(OBJECTIVE.encode()).hexdigest()
 INITIAL_TASK = os.getenv("INITIAL_TASK", os.getenv("FIRST_TASK", ""))
 
 # Model configuration
 OPENAI_TEMPERATURE = float(os.getenv("OPENAI_TEMPERATURE", 0.0))
-
 
 # Extensions support begin
 
@@ -102,22 +96,10 @@ print(f"{OBJECTIVE}")
 
 print("\033[93m\033[1m" + "\nInitial task:" + "\033[0m\033[0m" + f" {INITIAL_TASK}")
 
-# Configure OpenAI and Pinecone
+# Configure OpenAI
 openai.api_key = OPENAI_API_KEY
-pinecone.init(api_key=PINECONE_API_KEY, environment=PINECONE_ENVIRONMENT)
-
-# Create Pinecone index
-table_name = YOUR_TABLE_NAME
-dimension = 1536
-metric = "cosine"
-pod_type = "p1"
-if table_name not in pinecone.list_indexes():
-    pinecone.create_index(
-        table_name, dimension=dimension, metric=metric, pod_type=pod_type
-    )
-
-# Connect to the index
-index = pinecone.Index(table_name)
+chroma_client = chromadb.Client(chroma_settings)
+coll = chroma_client.get_or_create_collection(coll_name)
 
 # Task list
 task_list = deque([])
@@ -125,14 +107,6 @@ task_list = deque([])
 
 def add_task(task: Dict):
     task_list.append(task)
-
-
-def get_ada_embedding(text):
-    text = text.replace("\n", " ")
-    return openai.Embedding.create(input=[text], model="text-embedding-ada-002")[
-        "data"
-    ][0]["embedding"]
-
 
 def openai_call(
     prompt: str,
@@ -251,12 +225,13 @@ def context_agent(query: str, top_results_num: int):
         list: A list of tasks as context for the given query, sorted by relevance.
 
     """
-    query_embedding = get_ada_embedding(query)
-    results = index.query(query_embedding, top_k=top_results_num, include_metadata=True, namespace=OBJECTIVE)
+    tasks = []
+    if coll.count():
+        results = coll.query(query_texts = query, n_results=min(coll.count(), top_results_num))
+        return [(str(item["task"])) for item in results['metadatas'][0]]
     # print("***** RESULTS *****")
     # print(results)
-    sorted_results = sorted(results.matches, key=lambda x: x.score, reverse=True)
-    return [(str(item.metadata["task"])) for item in sorted_results]
+
 
 
 # Add the first task
@@ -282,24 +257,14 @@ while True:
         this_task_id = int(task["task_id"])
         print("\033[93m\033[1m" + "\n*****TASK RESULT*****\n" + "\033[0m\033[0m")
         print(result)
-
-        # Step 2: Enrich result and store in Pinecone
-        enriched_result = {
-            "data": result
-        }  # This is where you should enrich the result if needed
         result_id = f"result_{task['task_id']}"
-        vector = get_ada_embedding(
-            enriched_result["data"]
-        )  # get vector of the actual result extracted from the dictionary
-        index.upsert(
-            [(result_id, vector, {"task": task["task_name"], "result": result})],
-	    namespace=OBJECTIVE
-        )
+        coll.add(ids = result_id, documents=result, metadatas={"task": task["task_name"], "result": result})
+        chroma_client.persist()
 
         # Step 3: Create new tasks and reprioritize task list
         new_tasks = task_creation_agent(
             OBJECTIVE,
-            enriched_result,
+            result,
             task["task_name"],
             [t["task_name"] for t in task_list],
         )
